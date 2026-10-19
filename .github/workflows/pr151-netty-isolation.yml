@@ -1,0 +1,50 @@
+name: PR151 Netty isolation
+on:
+  push:
+    branches: [diagnostics/pr151-netty-jdk21]
+permissions:
+  contents: read
+jobs:
+  isolate:
+    name: ${{ matrix.revision }}-jdk${{ matrix.java }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [base, head]
+        java: ['17', '21']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: JingkaiTang/trpc-java
+          ref: ${{ matrix.revision == 'base' && '6d2a46043757c3053745beaecbae9f7ebd0b9a83' || '1b0271457b45827f4731eb627a0d7e253a9d97fa' }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Record environment and revision
+        run: |
+          git rev-parse HEAD
+          java -version
+          mvn -version
+      - name: Repeat original test in separate JVMs
+        shell: bash
+        run: |
+          mkdir -p diagnostic-results
+          failures=0
+          for attempt in $(seq 1 20); do
+            status=0
+            mvn -B -ntp -pl trpc-transport/trpc-transport-netty -am '-Dtest=NettyChannelTest#testTrpcNetty' -Dsurefire.failIfNoSpecifiedTests=false test > "diagnostic-results/attempt-$attempt.log" 2>&1 || status=$?
+            echo "attempt=$attempt exit=$status" | tee -a diagnostic-results/summary.txt
+            grep -E 'channle-size|channle created|channle closed|connected cnt|testTrpcNetty|BUILD SUCCESS|BUILD FAILURE' "diagnostic-results/attempt-$attempt.log" | tail -12 || true
+            if [ "$status" -ne 0 ]; then failures=$((failures+1)); fi
+            if [ -d trpc-transport/trpc-transport-netty/target/surefire-reports ]; then cp -r trpc-transport/trpc-transport-netty/target/surefire-reports "diagnostic-results/reports-$attempt"; fi
+          done
+          echo "failures=$failures/20" | tee -a diagnostic-results/summary.txt
+          test "$failures" -eq 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: netty-${{ matrix.revision }}-jdk${{ matrix.java }}
+          path: diagnostic-results
