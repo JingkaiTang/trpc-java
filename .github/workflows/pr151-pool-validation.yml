@@ -1,0 +1,80 @@
+name: PR151 pool candidate module validation
+on:
+  push:
+    branches: [diagnostics/pr151-pool-validation]
+permissions:
+  contents: read
+jobs:
+  race:
+    name: ${{ matrix.revision }}-jdk${{ matrix.java }}-${{ matrix.fix }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [base]
+        java: ['17', '21']
+        fix: [lock-recheck]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: diagnostics/pr151-pool-race
+          path: probe
+      - uses: actions/checkout@v4
+        with:
+          repository: JingkaiTang/trpc-java
+          ref: ${{ matrix.revision == 'base' && '6d2a46043757c3053745beaecbae9f7ebd0b9a83' || '1b0271457b45827f4731eb627a0d7e253a9d97fa' }}
+          path: source
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+          cache-dependency-path: source/**/pom.xml
+      - name: Install diagnostic test
+        run: cp probe/diagnostics/PoolReplacementRaceTest.java source/trpc-core/src/test/java/com/tencent/trpc/core/transport/
+      - name: Apply candidate only in runner
+        if: matrix.fix == 'lock-recheck'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('source/trpc-core/src/main/java/com/tencent/trpc/core/transport/AbstractClientTransport.java')
+          s = p.read_text()
+          start = s.index('    protected void ensureChannelActive(int chIndex) {')
+          end = s.index('    @Override', start)
+          s = s[:start] + '''    protected void ensureChannelActive(int chIndex) {
+                  connLock.lock();
+                  try {
+                      ChannelFutureItem curChannelItem = channels.get(chIndex);
+                      if ((!curChannelItem.isAvailable() && !curChannelItem.isConnecting())
+                              || curChannelItem.isNotYetConnect()) {
+                          channels.set(chIndex, new ChannelFutureItem(createChannel().toCompletableFuture(), config));
+                          try {
+                              curChannelItem.close();
+                          } catch (Exception ex) {
+                              logger.error("close " + curChannelItem + " exception", ex);
+                          }
+                      }
+                  } finally {
+                      connLock.unlock();
+                  }
+              }
+
+          ''' + s[end:]
+          p.write_text(s)
+          PY
+      - name: Run deterministic resource ownership regression
+        working-directory: source
+        run: |
+          git rev-parse HEAD
+          java -version
+          mvn -B -ntp -pl trpc-core -am -Dtest=PoolReplacementRaceTest -Dsurefire.failIfNoSpecifiedTests=false test
+      - name: Full core and Netty module tests with candidate
+        working-directory: source
+        run: mvn -B -ntp -pl trpc-transport/trpc-transport-netty -am test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pool-race-${{ matrix.revision }}-jdk${{ matrix.java }}-${{ matrix.fix }}
+          path: |
+            source/trpc-core/target/surefire-reports
+            source/trpc-transport/trpc-transport-netty/target/surefire-reports
